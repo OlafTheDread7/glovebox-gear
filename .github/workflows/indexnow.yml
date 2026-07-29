@@ -1,0 +1,78 @@
+name: IndexNow
+
+on:
+  push:
+    branches: [main, master]
+
+permissions:
+  contents: read
+
+jobs:
+  submit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+
+      - name: Submit changed pages to IndexNow
+        env:
+          HOST: glovebox-gear.com
+          KEY: 83e5299c5581482e9c0614088d30c7e3
+          CLEAN_URLS: "false"
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if ! git rev-parse HEAD^ >/dev/null 2>&1; then
+            echo "First commit on this branch - nothing to diff. Skipping."
+            exit 0
+          fi
+
+          mapfile -t files < <(git diff --name-only --diff-filter=ACMR HEAD^ HEAD -- '*.html')
+
+          if [ "${#files[@]}" -eq 0 ]; then
+            echo "No HTML changed in this push. Nothing to submit."
+            exit 0
+          fi
+
+          urls=()
+          for f in "${files[@]}"; do
+            case "$f" in
+              index.html)   urls+=("https://${HOST}/") ;;
+              */index.html) urls+=("https://${HOST}/${f%index.html}") ;;
+              *)
+                if [ "$CLEAN_URLS" = "true" ]; then
+                  urls+=("https://${HOST}/${f%.html}")
+                else
+                  urls+=("https://${HOST}/${f}")
+                fi
+                ;;
+            esac
+          done
+
+          echo "Submitting ${#urls[@]} URL(s):"
+          printf '  %s\n' "${urls[@]}"
+
+          payload=$(jq -n \
+            --arg host "$HOST" \
+            --arg key  "$KEY" \
+            --arg loc  "https://${HOST}/${KEY}.txt" \
+            --args '{host:$host, key:$key, keyLocation:$loc, urlList:$ARGS.positional}' \
+            "${urls[@]}")
+
+          code=$(curl -sS -o /tmp/indexnow.out -w '%{http_code}' -X POST \
+            -H 'Content-Type: application/json; charset=utf-8' \
+            --data "$payload" \
+            https://api.indexnow.org/indexnow)
+
+          echo "IndexNow responded: HTTP $code"
+          [ -s /tmp/indexnow.out ] && cat /tmp/indexnow.out
+
+          case "$code" in
+            200|202) echo "Accepted." ;;
+            403) echo "::error::Key rejected - check the key file is live."; exit 1 ;;
+            422) echo "::error::URLs did not match host."; exit 1 ;;
+            429) echo "::warning::Rate limited; not failing the build."; exit 0 ;;
+            *)   echo "::error::Unexpected response $code"; exit 1 ;;
+          esac
